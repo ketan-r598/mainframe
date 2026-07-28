@@ -1,0 +1,430 @@
+/* REXX ***************************************************************
+* Program : EXPANDCPY
+* Purpose : Expand COBOL copybooks inline from a source PDS
+*           - Iterates all members in source PDS
+*           - Detects COPY statements in cols 8-72
+*           - Expands copybook content inline
+*           - Comments out the original COPY statement
+*           - Writes expanded source to output PDS
+*           - Reports copybooks not found in copybook library
+* Usage   : TSO EXPANDCPY 'SRC.PDS' 'CPY.PDS' 'OUT.PDS'
+* Notes   : - Assumes standard 80-byte fixed COBOL source
+*           - Handles nested copybooks (iterative re-scan)
+*           - Guards against runaway expansion (max 10 iterations)
+*           - Output PDS must be pre-allocated with sufficient DIR blocks
+**********************************************************************/
+
+Parse Arg srcPDS cpyPDS outPDS
+
+/* Remove surrounding quotes if user passed them */
+srcPDS = Strip(srcPDS,,"'")
+cpyPDS = Strip(cpyPDS,,"'")
+outPDS = Strip(outPDS,,"'")
+
+/* Validate arguments */
+If srcPDS = '' | cpyPDS = '' | outPDS = '' Then Do
+    Say 'Usage: EXPANDCPY source_PDS copybook_PDS output_PDS'
+    Say 'Example: EXPANDCPY PROD.COBOL.SRC PROD.COPYLIB PROD.COBOL.EXP'
+    Exit 8
+End
+
+/* Global counters & stems */
+missing.      = ''
+missingCount  = 0
+processedCount= 0
+expandedCount = 0
+srcOpen       = 0
+
+/* ISPF Data IDs */
+srcId  = ''
+cpyId  = ''
+outId  = ''
+tempId = ''
+
+/* TSO DD names */
+srcDD  = 'SRC' || Random(100,999)
+cpyDD  = 'CPY' || Random(100,999)
+tempDD = 'TMP' || Random(100,999)
+
+/* Temporary sequential dataset used to stage output for LMMADD/LMMREP */
+tempDS = 'TEMP.' || Userid() || '.EXPAND.' || Random(1000,9999)
+
+Call Init
+Call ProcessAllMembers
+Call PrintReport
+Call Cleanup
+
+Exit 0
+
+/* ------------------------------------------------------------------ */
+/* Initialize ISPF data IDs and allocate temp staging dataset           */
+/* ------------------------------------------------------------------ */
+Init:
+    Address ISPEXEC
+
+    /* Source PDS - for listing members */
+    "LMINIT DATAID("srcId") DATASET('"srcPDS"') ENQ(SHR)"
+    If rc <> 0 Then Do
+        Say 'ERROR: Cannot LMINIT source PDS:' srcPDS 'RC='rc
+        Exit 12
+    End
+
+    /* Copybook PDS - for existence checking via LMMFIND */
+    "LMINIT DATAID("cpyId") DATASET('"cpyPDS"') ENQ(SHR)"
+    If rc <> 0 Then Do
+        Say 'ERROR: Cannot LMINIT copybook PDS:' cpyPDS 'RC='rc
+        Exit 12
+    End
+
+    /* Output PDS - exclusive for updates */
+    "LMINIT DATAID("outId") DATASET('"outPDS"') ENQ(EXCLU)"
+    If rc <> 0 Then Do
+        Say 'ERROR: Cannot LMINIT output PDS:' outPDS 'RC='rc
+        Exit 12
+    End
+
+    /* Temp sequential file to stage member content before LMMADD/LMMREP */
+    Address TSO
+    "ALLOC FI("tempDD") DA('"tempDS"') NEW CATALOG REUSE",
+        "LRECL(80) RECFM(F B) BLKSIZE(27920)",
+        "SPACE(5,5) TRACKS UNIT(SYSDA)"
+    If rc <> 0 Then Do
+        Say 'ERROR: Cannot allocate temp dataset:' tempDS
+        Exit 12
+    End
+
+    /* Let ISPF know about the temp file (remains allocated throughout) */
+    Address ISPEXEC
+    "LMINIT DATAID("tempId") DDNAME("tempDD") ENQ(SHR)"
+    If rc <> 0 Then Do
+        Say 'ERROR: Cannot LMINIT temp dataset RC='rc
+        Exit 12
+    End
+
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Iterate every member in the source PDS using LMMLIST               */
+/* ------------------------------------------------------------------ */
+ProcessAllMembers:
+    Address ISPEXEC
+    "LMOPEN DATAID("srcId") OPTION(INPUT)"
+    srcOpen = 1
+
+    /* Fetch first member */
+    "LMMLIST DATAID("srcId") OPTION(LIST) MEMBER(MEM) STATS(NO)"
+
+    Do While rc = 0
+        processedCount = processedCount + 1
+        Say 'Processing member:' Mem
+        Call ProcessMember(Mem)
+        "LMMLIST DATAID("srcId") OPTION(LIST) MEMBER(MEM) STATS(NO)"
+    End
+
+    "LMCLOSE DATAID("srcId")"
+    srcOpen = 0
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Read one source member, expand copybooks, write to output          */
+/* ------------------------------------------------------------------ */
+ProcessMember:
+    Parse Arg member
+
+    /* Read source into src. stem */
+    Call ReadMember(srcPDS, member, 'src.')
+    If src.0 = 0 Then Do
+        Say '  Warning: Member is empty or could not be read:' member
+        Return
+    End
+
+    /* Expand all COPY statements iteratively */
+    Call ExpandCopybooks('src.', 'out.')
+
+    /* Write the expanded result to output PDS */
+    Call WriteOutputMember(member, 'out.')
+
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Read a PDS member into a stem using TSO ALLOC + EXECIO             */
+/* ------------------------------------------------------------------ */
+ReadMember:
+    Parse Arg pds, member, stem
+
+    Address TSO
+    "ALLOC FI("srcDD") DA('"pds"("member")') SHR REUSE"
+    If rc <> 0 Then Do
+        Say '  ERROR: Cannot allocate member' pds'('member')'
+        Interpret stem"0 = 0"
+        Return
+    End
+
+    "EXECIO * DISKR "srcDD" (STEM "stem" FINIS"
+    "FREE FI("srcDD")"
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Core logic: scan lines, detect COPY, expand inline                 */
+/* ------------------------------------------------------------------ */
+ExpandCopybooks:
+    Parse Arg inStem, outStem
+
+    /* Seed working stem from input */
+    work.0 = Value(inStem'0')
+    Do i = 1 To work.0
+        work.i = Value(inStem||i)
+    End
+
+    /* Iteratively expand until no more COPY statements found         */
+    /* This naturally handles nested copybooks (copybook has COPY)    */
+    Do iterations = 1 To 10
+        changed = 0
+        new.0   = 0
+        newIdx  = 0
+
+        Do i = 1 To work.0
+            line = work.i
+
+            If IsCopyStatement(line) Then Do
+                cpyName = ExtractCopybookName(line)
+
+                If cpyName = '' Then Do
+                    /* Unparseable COPY line - pass through */
+                    newIdx = newIdx + 1
+                    new.newIdx = line
+                End
+                Else Do
+                    /* Comment out the original COPY statement */
+                    commented = CommentLine(line)
+
+                    If CopybookExists(cpyName) Then Do
+                        Call ReadMember(cpyPDS, cpyName, 'cpy.')
+
+                        If cpy.0 > 0 Then Do
+                            changed = 1
+                            expandedCount = expandedCount + 1
+
+                            /* Insert commented COPY line first */
+                            newIdx = newIdx + 1
+                            new.newIdx = commented
+
+                            /* Insert copybook content */
+                            Do j = 1 To cpy.0
+                                newIdx = newIdx + 1
+                                new.newIdx = cpy.j
+                            End
+                        End
+                        Else Do
+                            /* Copybook empty - just comment out */
+                            newIdx = newIdx + 1
+                            new.newIdx = commented
+                        End
+                    End
+                    Else Do
+                        /* Copybook missing - report & comment out */
+                        Call ReportMissing(cpyName)
+                        newIdx = newIdx + 1
+                        new.newIdx = commented
+                    End
+                End
+            End
+            Else Do
+                /* Regular line - keep unchanged */
+                newIdx = newIdx + 1
+                new.newIdx = line
+            End
+        End
+
+        new.0 = newIdx
+
+        /* If nothing changed this pass, expansion is complete */
+        If changed = 0 Then Leave
+
+        /* Move new buffer back to work for next scan */
+        work.0 = new.0
+        Do i = 1 To work.0
+            work.i = new.i
+        End
+    End
+
+    /* Guard: if we hit 10 iterations, likely circular reference */
+    If iterations > 10 Then
+        Say '  Warning: Max iterations reached - possible circular COPY'
+
+    /* Return final buffer to caller's stem */
+    out.0 = work.0
+    Do i = 1 To work.0
+        out.i = work.i
+    End
+
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Returns 1 if the line contains a COBOL COPY statement              */
+/* ------------------------------------------------------------------ */
+IsCopyStatement:
+    Parse Arg line
+
+    If Length(line) < 8 Then Return 0
+
+    /* Skip comments, debugging lines, continuations in indicator area */
+    ind = Substr(line, 7, 1)
+    If ind = '*' | ind = '/' | ind = '$' | ind = 'D' | ind = 'd' | ind = '-' Then
+        Return 0
+
+    /* Look at code area (cols 8-72) */
+    code = Substr(line, 8, 65)
+    up   = Translate(code)
+
+    /* COPY must appear as a whole word followed by space */
+    p = Pos('COPY ', up)
+    If p = 0 Then Return 0
+
+    /* Ensure not part of a larger word like PRE-COPY */
+    If p > 1 Then Do
+        If Substr(up, p - 1, 1) <> ' ' Then Return 0
+    End
+
+    Return 1
+
+/* ------------------------------------------------------------------ */
+/* Extract copybook name from a COPY statement line                   */
+/* ------------------------------------------------------------------ */
+ExtractCopybookName:
+    Parse Arg line
+
+    code = Substr(line, 8, 65)
+    up   = Translate(code)
+
+    p = Pos('COPY ', up)
+    rest = Substr(up, p + 5)
+
+    /* First token after COPY is the copybook name */
+    name = Word(rest, 1)
+
+    /* Strip trailing period if present */
+    If Right(name, 1) = '.' Then
+        name = Substr(name, 1, Length(name) - 1)
+
+    Return name
+
+/* ------------------------------------------------------------------ */
+/* Comment out a COBOL line by placing * in column 7                  */
+/* ------------------------------------------------------------------ */
+CommentLine:
+    Parse Arg line
+    If Length(line) < 7 Then
+        Return Copies(' ', 6) || '* ' || line
+    Return Substr(line, 1, 6) || '*' || Substr(line, 8)
+
+/* ------------------------------------------------------------------ */
+/* Check if copybook member exists in the copybook PDS                */
+/* ------------------------------------------------------------------ */
+CopybookExists:
+    Parse Arg cpyName
+
+    Address ISPEXEC
+    "LMMFIND DATAID("cpyId") MEMBER("cpyName") STATS(NO)"
+
+    If rc = 0 Then Return 1
+    Return 0
+
+/* ------------------------------------------------------------------ */
+/* Log a missing copybook (avoid duplicate entries)                   */
+/* ------------------------------------------------------------------ */
+ReportMissing:
+    Parse Arg cpyName
+
+    Do i = 1 To missingCount
+        If missing.i = cpyName Then Return
+    End
+
+    missingCount = missingCount + 1
+    missing.missingCount = cpyName
+    Say '  MISSING Copybook:' cpyName
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Write expanded stem to output PDS via temp file + LMMADD/LMMREP    */
+/* ------------------------------------------------------------------ */
+WriteOutputMember:
+    Parse Arg member, stem
+
+    Address TSO
+
+    /* Stage content into the temp sequential file */
+    "EXECIO "Value(stem'0')" DISKW "tempDD" (STEM "stem" FINIS"
+
+    /* Use ISPF to move from temp file into output PDS member */
+    Address ISPEXEC
+    "LMOPEN DATAID("tempId") OPTION(INPUT)"
+
+    /* Does member already exist in output? */
+    "LMMFIND DATAID("outId") MEMBER("member") STATS(NO)"
+
+    If rc = 0 Then Do
+        "LMMREP DATAID("outId") MEMBER("member") FROMDATAID("tempId")"
+        If rc <> 0 Then
+            Say '  ERROR: LMMREP failed for' member 'ISPF RC='rc
+    End
+    Else Do
+        "LMMADD DATAID("outId") MEMBER("member") FROMDATAID("tempId")"
+        If rc <> 0 Then
+            Say '  ERROR: LMMADD failed for' member 'ISPF RC='rc
+    End
+
+    "LMCLOSE DATAID("tempId")"
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Print final summary report                                         */
+/* ------------------------------------------------------------------ */
+PrintReport:
+    Say ''
+    Say '============================================================'
+    Say '              COPYBOOK EXPANSION SUMMARY REPORT'
+    Say '============================================================'
+    Say 'Source PDS       :' srcPDS
+    Say 'Copybook Library :' cpyPDS
+    Say 'Output PDS       :' outPDS
+    Say 'Members Processed:' Right(processedCount, 5)
+    Say 'Copybooks Expanded:' Right(expandedCount, 5)
+    Say ''
+
+    If missingCount > 0 Then Do
+        Say 'MISSING COPYBOOKS (not found in copybook library):'
+        Say '------------------------------------------------------------'
+        Do i = 1 To missingCount
+            Say '  ' missing.i
+        End
+        Say ''
+        Say 'Total Missing:' missingCount
+    End
+    Else Do
+        Say 'All referenced copybooks were found in the library.'
+    End
+
+    Say '============================================================'
+    Return
+
+/* ------------------------------------------------------------------ */
+/* Cleanup ISPF data IDs and temp dataset                             */
+/* ------------------------------------------------------------------ */
+Cleanup:
+    Address ISPEXEC
+
+    If srcOpen Then "LMCLOSE DATAID("srcId")"
+    "LMFREE DATAID("srcId")"
+
+    "LMFREE DATAID("cpyId")"
+    "LMFREE DATAID("outId")"
+
+    "LMCLOSE DATAID("tempId")"
+    "LMFREE DATAID("tempId")"
+
+    Address TSO
+    "FREE FI("tempDD")"
+    "DELETE '"tempDS"'"
+
+    Return
