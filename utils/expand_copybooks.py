@@ -59,8 +59,11 @@ def is_copy_statement(line: str) -> bool:
     code_area = line[7:72]
     upper_code = code_area.upper()
 
-    # Look for COPY as a whole word followed by space or end
-    match = re.search(r'\bCOPY\b', upper_code)
+    # FIX 2: Changed from r'\bCOPY\b' to r'^\s*COPY\s+'
+    # This ensures COPY is the first significant token in the code area
+    # and is followed by whitespace. Prevents false positives like:
+    #   WS-COPY-FLAG, COPYRIGHT-INFO, 01 COPY-STRUCTURE, etc.
+    match = re.search(r'^\s*COPY\s+', upper_code)
     return bool(match)
 
 
@@ -79,12 +82,13 @@ def extract_copybook_name(line: str) -> str:
     code_area = line[7:72]
     upper_code = code_area.upper()
 
-    # Find the COPY keyword
-    match = re.search(r'\bCOPY\b', upper_code)
+    # FIX 2: Changed from r'\bCOPY\b' to r'^\s*COPY\s+'
+    # Aligns with the stricter detection in is_copy_statement().
+    match = re.search(r'^\s*COPY\s+', upper_code)
     if not match:
         return ''
 
-    # Everything after COPY
+    # Everything after COPY (and its trailing whitespace)
     after_copy = code_area[match.end():].strip()
 
     if not after_copy:
@@ -196,10 +200,13 @@ def expand_copybooks(lines: List[str], copybook_dir: Path,
                         # Empty copybook — just comment out COPY
                         new_lines.append(comment_line(line))
                 else:
-                    # Copybook not found — report and comment out
+                    # FIX 1: Copybook not found — report and PRESERVE original line
+                    # Previously this was: new_lines.append(comment_line(line))
+                    # Now we keep the COPY statement as-is so it can be searched
+                    # for in the mainframe PDS.
                     missing_log.add(cpy_name)
                     print(f"    MISSING Copybook: {cpy_name}")
-                    new_lines.append(comment_line(line))
+                    new_lines.append(line)
             else:
                 new_lines.append(line)
 
