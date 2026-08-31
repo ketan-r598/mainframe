@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 COBOL Call Tree Analyzer
 ========================
@@ -21,6 +20,7 @@ Features:
     - Attempts to resolve dynamic variables by tracing:
         * VALUE clauses in WORKING-STORAGE
         * MOVE literal TO variable in PROCEDURE DIVISION
+        * Transitive variable chains (A -> B -> C -> 'literal')
     - Detects CICS LINK / XCTL program transfers (including multi-line blocks)
     - Identifies root programs (not called by any other program in the set)
     - Handles missing/unresolved calls gracefully
@@ -369,13 +369,15 @@ def extract_procedure_assignments(lines: List[str]) -> Dict[str, List[str]]:
 
 def resolve_dynamic_variable(var_name: str,
                              ws_values: Dict[str, str],
-                             proc_assignments: Dict[str, List[str]]) -> Optional[str]:
+                             proc_assignments: Dict[str, List[str]],
+                             visited: Optional[Set[str]] = None) -> Optional[str]:
     """
     Try to resolve a dynamic CALL variable to a program name.
+    Follows transitive variable assignments (A -> B -> C -> 'literal').
 
     Checks:
     1. WORKING-STORAGE VALUE clause
-    2. PROCEDURE DIVISION MOVE statements
+    2. PROCEDURE DIVISION MOVE statements (with transitive resolution)
 
     Returns the resolved name if found, None otherwise.
     """
@@ -384,18 +386,39 @@ def resolve_dynamic_variable(var_name: str,
         'LOW-VALUE', 'LOW-VALUES', 'HIGH-VALUE', 'HIGH-VALUES'
     }
 
+    if visited is None:
+        visited = set()
+
+    # Prevent infinite recursion on circular assignments (A -> B -> A)
+    if var_name in visited:
+        return None
+    visited.add(var_name)
+
+    def _try_resolve(val: str) -> Optional[str]:
+        """Try to resolve a single value string."""
+        v = val.strip().strip('"\'')
+        if not v or v.upper() in figurative:
+            return None
+
+        # If this value is itself a known variable, recurse transitively
+        if v in ws_values or v in proc_assignments:
+            return resolve_dynamic_variable(v, ws_values, proc_assignments, visited)
+
+        # Otherwise, treat as a literal program name
+        return v
+
     # Check WORKING-STORAGE
     if var_name in ws_values:
-        val = ws_values[var_name].strip().strip('"\'')
-        if val and val.upper() not in figurative:
-            return val
+        result = _try_resolve(ws_values[var_name])
+        if result:
+            return result
 
     # Check PROCEDURE assignments
     if var_name in proc_assignments:
         for val in proc_assignments[var_name]:
-            v = val.strip().strip('"\'')
-            if v and v.upper() not in figurative:
-                return v
+            result = _try_resolve(val)
+            if result:
+                return result
 
     return None
 
@@ -427,12 +450,14 @@ def extract_call_statements(lines: List[str]) -> List[CallInfo]:
         code = get_code_area(line).upper()
 
         # Skip EXEC SQL lines (stored procedure calls, not subprogram calls)
-        if 'EXEC SQL' in code:
+        # Use negative lookbehind to avoid matching EXEC inside data names like WS-EXEC-SQL
+        if re.search(r'(?<![A-Za-z0-9#@$-])EXEC\s+SQL', code):
             continue
 
         # --- CICS LINK PROGRAM(...) ---
+        # Negative lookbehind prevents matching EXEC inside identifiers like WS-EXEC-CICS
         cics_link_match = re.search(
-            r'EXEC\s+CICS\s+LINK\s+PROGRAM\s*\(\s*'
+            r'(?<![A-Za-z0-9#@$-])EXEC\s+CICS\s+LINK\s+PROGRAM\s*\(\s*'
             r'(?:"([^"]*)"'
             r"|'([^']*)'"
             r'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))\s*\)',
@@ -457,8 +482,9 @@ def extract_call_statements(lines: List[str]) -> List[CallInfo]:
             continue
 
         # --- CICS XCTL PROGRAM(...) ---
+        # Negative lookbehind prevents matching EXEC inside identifiers like WS-EXEC-CICS
         cics_xctl_match = re.search(
-            r'EXEC\s+CICS\s+XCTL\s+PROGRAM\s*\(\s*'
+            r'(?<![A-Za-z0-9#@$-])EXEC\s+CICS\s+XCTL\s+PROGRAM\s*\(\s*'
             r'(?:"([^"]*)"'
             r"|'([^']*)'"
             r'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))\s*\)',
@@ -483,8 +509,9 @@ def extract_call_statements(lines: List[str]) -> List[CallInfo]:
             continue
 
         # --- COBOL CALL ---
+        # Negative lookbehind prevents matching CALL inside identifiers like WS-SQL-CALL
         call_match = re.search(
-            r'CALL\s+'
+            r'(?<![A-Za-z0-9#@$-])CALL\s+'
             r'(?:"([^"]*)"'
             r"|'([^']*)'"
             r'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))',
@@ -587,21 +614,32 @@ def process_source_file(filepath: Path) -> Tuple[Optional[ProgramInfo], bool]:
 # Call Graph & Tree Building
 # ============================================================================
 
+def _build_name_map(programs: Dict[str, ProgramInfo]) -> Dict[str, str]:
+    """
+    Build an uppercase -> original name mapping for case-insensitive lookups.
+    COBOL program names are case-insensitive on mainframes.
+    """
+    return {name.upper(): name for name in programs.keys()}
+
+
 def build_call_graph(programs: Dict[str, ProgramInfo]) -> Dict[str, ProgramInfo]:
     """
     Build the complete call graph including 'called_by' relationships.
 
     A program is marked as 'main' (root) if no other program in the
     analyzed set calls it. Self-calls are excluded from this check.
+    Matching is case-insensitive (COBOL standard).
     """
-    all_names = set(programs.keys())
+    name_map = _build_name_map(programs)
+    all_names_upper = set(name_map.keys())
 
-    # Build called_by relationships
+    # Build called_by relationships (case-insensitive)
     for prog_name, info in programs.items():
         for call in info.calls:
-            callee = call.callee
-            if callee in all_names:
-                programs[callee].called_by.add(prog_name)
+            callee_upper = call.callee.upper()
+            if callee_upper in all_names_upper:
+                actual_name = name_map[callee_upper]
+                programs[actual_name].called_by.add(prog_name)
 
     # Identify main programs (exclude self-calls from the check)
     for prog_name, info in programs.items():
@@ -616,8 +654,10 @@ def build_call_trees(programs: Dict[str, ProgramInfo]) -> List[TreeNode]:
 
     A program called by multiple parents may appear in multiple trees
     or multiple branches. Cycles are detected and marked.
+    Matching is case-insensitive (COBOL standard).
     """
-    all_names = set(programs.keys())
+    name_map = _build_name_map(programs)
+    all_names_upper = set(name_map.keys())
     roots = sorted(name for name, info in programs.items() if info.is_main)
 
     trees: List[TreeNode] = []
@@ -651,23 +691,25 @@ def build_call_trees(programs: Dict[str, ProgramInfo]) -> List[TreeNode]:
                 child.is_leaf = True
                 node.children.append(child)
 
-            elif call.callee in all_names:
-                # Known program in our directory
-                child = build_subtree(call.callee, new_visited)
-                if child:
-                    child.call_type = call.call_type
-                    child.resolved_name = call.resolved_name
-                    node.children.append(child)
-
             else:
-                # External program (not in directory)
-                child = TreeNode(
-                    program_name=call.callee,
-                    call_type=call.call_type,
-                    resolved_name=call.resolved_name
-                )
-                child.is_leaf = True
-                node.children.append(child)
+                callee_upper = call.callee.upper()
+                if callee_upper in all_names_upper:
+                    # Known program in our directory — recurse transitively
+                    actual_name = name_map[callee_upper]
+                    child = build_subtree(actual_name, new_visited)
+                    if child:
+                        child.call_type = call.call_type
+                        child.resolved_name = call.resolved_name
+                        node.children.append(child)
+                else:
+                    # External program (not in directory)
+                    child = TreeNode(
+                        program_name=call.callee,
+                        call_type=call.call_type,
+                        resolved_name=call.resolved_name
+                    )
+                    child.is_leaf = True
+                    node.children.append(child)
 
         return node
 
@@ -783,13 +825,16 @@ def print_summary_report(programs: Dict[str, ProgramInfo]) -> None:
     external_calls = 0
     all_callees: Set[str] = set()
 
+    name_map = _build_name_map(programs)
+    all_names_upper = set(name_map.keys())
+
     for info in programs.values():
         for call in info.calls:
             all_callees.add(call.callee)
             stats[call.call_type] += 1
             if call.call_type == 'DYNAMIC' and not call.resolved_name:
                 unresolved.append((info.name, call.raw_value or 'unknown'))
-            if call.callee not in programs and not call.callee.startswith('UNRESOLVED:'):
+            if call.callee.upper() not in all_names_upper and not call.callee.startswith('UNRESOLVED:'):
                 external_calls += 1
 
     print("=" * 78)
@@ -829,9 +874,11 @@ def export_csv(programs: Dict[str, ProgramInfo], output_path: Path) -> None:
                 'Caller Program', 'Callee Program', 'Call Type',
                 'Resolved Name', 'Raw Value', 'Callee in Directory'
             ])
+            name_map = _build_name_map(programs)
+            all_names_upper = set(name_map.keys())
             for info in programs.values():
                 for call in info.calls:
-                    in_dir = 'Yes' if call.callee in programs else 'No'
+                    in_dir = 'Yes' if call.callee.upper() in all_names_upper else 'No'
                     writer.writerow([
                         info.name,
                         call.callee,
