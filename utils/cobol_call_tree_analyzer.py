@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 COBOL Call Tree Analyzer
 ========================
@@ -159,9 +158,6 @@ def normalize_cics_blocks(lines: List[str]) -> List[str]:
 
     Output:
         EXEC CICS LINK PROGRAM('PROGNAME') RESP(WS-RESP) END-EXEC.
-
-    This ensures the per-line regex in extract_call_statements() can
-    match CICS commands regardless of how many lines they span.
     """
     result: List[str] = []
     i = 0
@@ -194,9 +190,7 @@ def normalize_cics_blocks(lines: List[str]) -> List[str]:
             # Collapse block into one logical line
             collapsed = ' '.join(block_parts)
             # Reconstruct a fixed-format line with the collapsed content
-            # Preserve sequence area (columns 1-6) from the original EXEC CICS line
             seq = line[:6] if len(line) >= 6 else line.ljust(6)
-            # Place a space in indicator column so it is not treated as comment
             new_line = seq + ' ' + collapsed
             result.append(new_line)
             continue
@@ -258,12 +252,6 @@ def extract_working_storage_values(lines: List[str]) -> Dict[str, str]:
     """
     Scan WORKING-STORAGE SECTION for variable declarations with VALUE clauses.
 
-    Captures:
-        77  WS-PROG  PIC X(8)  VALUE 'PROGNAME'.
-        05  WS-PROG  PIC X(8)  VALUE "PROGNAME".
-        05  WS-PROG  VALUE 'PROGNAME'.
-        05  WS-PROG  PIC X(8)  VALUE IS 'PROGNAME'.
-
     Returns a dict: variable_name -> literal_value
     """
     values: Dict[str, str] = {}
@@ -309,11 +297,6 @@ def extract_working_storage_values(lines: List[str]) -> Dict[str, str]:
 def extract_procedure_assignments(lines: List[str]) -> Dict[str, List[str]]:
     """
     Scan PROCEDURE DIVISION for MOVE statements that assign literals to variables.
-
-    Captures:
-        MOVE 'literal' TO variable
-        MOVE "literal" TO variable
-        MOVE figurative-constant TO variable
 
     Returns dict: variable_name -> list of assigned values
     """
@@ -376,10 +359,6 @@ def resolve_dynamic_variable(var_name: str,
     Try to resolve a dynamic CALL variable to a program name.
     Follows transitive variable assignments (A -> B -> C -> 'literal').
 
-    Checks:
-    1. WORKING-STORAGE VALUE clause
-    2. PROCEDURE DIVISION MOVE statements (with transitive resolution)
-
     Returns the resolved name if found, None otherwise.
     """
     figurative = {
@@ -428,17 +407,6 @@ def resolve_dynamic_variable(var_name: str,
 # CALL Statement Detection
 # ============================================================================
 
-def _strip_quoted_strings(text: str) -> str:
-    """
-    Replace quoted substrings with spaces of equal length.
-    Prevents keywords inside literals (e.g. 'TYPE INVALID CALL I.T.S')
-    from being matched as real statements.
-    """
-    text = re.sub(r'"[^"]*"', lambda m: ' ' * len(m.group(0)), text)
-    text = re.sub(r"'[^']*'", lambda m: ' ' * len(m.group(0)), text)
-    return text
-
-
 def extract_call_statements(lines: List[str]) -> List[CallInfo]:
     """
     Extract all subprogram calls from COBOL source lines.
@@ -459,109 +427,99 @@ def extract_call_statements(lines: List[str]) -> List[CallInfo]:
         if is_comment_or_skip_line(line):
             continue
 
-        # Strip quoted strings from the FULL line first (including cols 73+)
-        # because long literals may extend into the identification area.
-        # Then extract the code area for keyword searching.
-        full_clean = _strip_quoted_strings(line.upper())
         code = get_code_area(line).upper()
-        code_clean = get_code_area(full_clean)
 
         # Skip EXEC SQL lines (stored procedure calls, not subprogram calls)
-        if re.search(r'(?<![A-Za-z0-9#@$-])EXEC\s+SQL', code_clean):
+        if re.search(r'^\s*EXEC\s+SQL', code):
             continue
 
         # --- CICS LINK PROGRAM(...) ---
-        for m in re.finditer(
-            r'(?<![A-Za-z0-9#@$-])EXEC\s+CICS\s+LINK\s+PROGRAM\s*\(\s*',
-            code_clean
-        ):
-            pos = m.end()
-            remainder = code[pos:]
-            val_match = re.match(
-                r'(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))\s*\)',
-                remainder
-            )
-            if val_match:
-                raw = val_match.group(1) or val_match.group(2) or val_match.group(3)
-                prog = raw.strip('"\'') if raw else ''
-                resolved = None
-                if prog and not (val_match.group(1) or val_match.group(2)):
-                    resolved = resolve_dynamic_variable(prog, ws_values, proc_assignments)
-                    if resolved:
-                        prog = resolved
-                if prog:
-                    calls.append(CallInfo(
-                        callee=prog,
-                        call_type='CICS-LINK',
-                        resolved_name=resolved,
-                        raw_value=raw
-                    ))
-
-        # --- CICS XCTL PROGRAM(...) ---
-        for m in re.finditer(
-            r'(?<![A-Za-z0-9#@$-])EXEC\s+CICS\s+XCTL\s+PROGRAM\s*\(\s*',
-            code_clean
-        ):
-            pos = m.end()
-            remainder = code[pos:]
-            val_match = re.match(
-                r'(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))\s*\)',
-                remainder
-            )
-            if val_match:
-                raw = val_match.group(1) or val_match.group(2) or val_match.group(3)
-                prog = raw.strip('"\'') if raw else ''
-                resolved = None
-                if prog and not (val_match.group(1) or val_match.group(2)):
-                    resolved = resolve_dynamic_variable(prog, ws_values, proc_assignments)
-                    if resolved:
-                        prog = resolved
-                if prog:
-                    calls.append(CallInfo(
-                        callee=prog,
-                        call_type='CICS-XCTL',
-                        resolved_name=resolved,
-                        raw_value=raw
-                    ))
-
-        # --- COBOL CALL ---
-        for m in re.finditer(
-            r'(?<![A-Za-z0-9#@$-])CALL\s+',
-            code_clean
-        ):
-            pos = m.end()
-            remainder = code[pos:]
-            call_match = re.match(
-                r'(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))',
-                remainder
-            )
-            if not call_match:
-                continue
-
-            raw = call_match.group(1) or call_match.group(2) or call_match.group(3)
-            if not raw:
-                continue
-
-            # Quoted literal = STATIC call
-            if call_match.group(1) or call_match.group(2):
-                prog_name = raw.strip('"\'').strip()
-                if prog_name:
-                    calls.append(CallInfo(
-                        callee=prog_name,
-                        call_type='STATIC',
-                        resolved_name=prog_name,
-                        raw_value=raw
-                    ))
-            else:
-                # Unquoted identifier = DYNAMIC call
-                resolved = resolve_dynamic_variable(raw, ws_values, proc_assignments)
-                callee_name = resolved if resolved else f"UNRESOLVED:{raw}"
+        cics_link_match = re.search(
+            r'^\s*EXEC\s+CICS\s+LINK\s+PROGRAM\s*\(\s*'
+            r'(?:\"([^\"]*)\"'
+            r"|'([^']*)'"
+            r'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))\s*\)',
+            code
+        )
+        if cics_link_match:
+            raw = cics_link_match.group(1) or cics_link_match.group(2) or cics_link_match.group(3)
+            prog = raw.strip('"\'') if raw else ''
+            resolved = None
+            if prog and not (cics_link_match.group(1) or cics_link_match.group(2)):
+                resolved = resolve_dynamic_variable(prog, ws_values, proc_assignments)
+                if resolved:
+                    prog = resolved
+            if prog:
                 calls.append(CallInfo(
-                    callee=callee_name,
-                    call_type='DYNAMIC',
+                    callee=prog,
+                    call_type='CICS-LINK',
                     resolved_name=resolved,
                     raw_value=raw
                 ))
+            continue
+
+        # --- CICS XCTL PROGRAM(...) ---
+        cics_xctl_match = re.search(
+            r'^\s*EXEC\s+CICS\s+XCTL\s+PROGRAM\s*\(\s*'
+            r'(?:\"([^\"]*)\"'
+            r"|'([^']*)'"
+            r'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))\s*\)',
+            code
+        )
+        if cics_xctl_match:
+            raw = cics_xctl_match.group(1) or cics_xctl_match.group(2) or cics_xctl_match.group(3)
+            prog = raw.strip('"\'') if raw else ''
+            resolved = None
+            if prog and not (cics_xctl_match.group(1) or cics_xctl_match.group(2)):
+                resolved = resolve_dynamic_variable(prog, ws_values, proc_assignments)
+                if resolved:
+                    prog = resolved
+            if prog:
+                calls.append(CallInfo(
+                    callee=prog,
+                    call_type='CICS-XCTL',
+                    resolved_name=resolved,
+                    raw_value=raw
+                ))
+            continue
+
+        # --- COBOL CALL ---
+        # ^\s*CALL ensures CALL is the first significant token in the code area.
+        # This eliminates false positives like WS-SQL-CALL, 'TYPE INVALID CALL I.T.S', etc.
+        call_match = re.search(
+            r'^\s*CALL\s+'
+            r'(?:\"([^\"]*)\"'
+            r"|'([^']*)'"
+            r'|([A-Za-z0-9#@$][A-Za-z0-9#@$-]*))',
+            code
+        )
+        if not call_match:
+            continue
+
+        raw = call_match.group(1) or call_match.group(2) or call_match.group(3)
+        if not raw:
+            continue
+
+        # Quoted literal = STATIC call
+        if call_match.group(1) or call_match.group(2):
+            prog_name = raw.strip('"\'').strip()
+            if prog_name:
+                calls.append(CallInfo(
+                    callee=prog_name,
+                    call_type='STATIC',
+                    resolved_name=prog_name,
+                    raw_value=raw
+                ))
+        else:
+            # Unquoted identifier = DYNAMIC call
+            resolved = resolve_dynamic_variable(raw, ws_values, proc_assignments)
+            callee_name = resolved if resolved else f"UNRESOLVED:{raw}"
+            calls.append(CallInfo(
+                callee=callee_name,
+                call_type='DYNAMIC',
+                resolved_name=resolved,
+                raw_value=raw
+            ))
 
     # Deduplicate while preserving order
     seen: Set[Tuple[str, str, Optional[str]]] = set()
@@ -642,7 +600,7 @@ def _build_name_map(programs: Dict[str, ProgramInfo]) -> Dict[str, str]:
 
 def build_call_graph(programs: Dict[str, ProgramInfo]) -> Dict[str, ProgramInfo]:
     """
-n    Build the complete call graph including 'called_by' relationships.
+    Build the complete call graph including 'called_by' relationships.
 
     A program is marked as 'main' (root) if no other program in the
     analyzed set calls it. Self-calls are excluded from this check.
