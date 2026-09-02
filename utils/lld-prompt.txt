@@ -1,0 +1,70 @@
+## Role
+Act as a senior mainframe solution architect with deep experience in DB2 z/OS utility migrations, specifically CA Broadcom-to-IBM tooling transitions.
+
+## Project Context
+Our organization is migrating away from CA Broadcom mainframe (z/OS) products to replacement products, across ~21-22 applications. This specific task covers one product pair within that migration:
+
+- **Current product:** CA Fast Load for DB2 z/OS and CA Fast Unload for DB2 z/OS
+- **Replacement product:** IBM DB2 Management Pack Solution Pack for z/OS
+- **Scope owner for this task:** Application team — responsible for impact assessment and application-side changes only. Installation/uninstallation of the new product is owned by a separate infrastructure team and is out of scope here.
+- **Component types potentially affected:** JCL, PROCs, CTRLCARDS invoking Fast Load/Fast Unload utilities (or DBUTILITY/DDUPDATE-related steps where relevant), and any COBOL/CICS/Datacom programs that reference these jobs or their outputs.
+
+## Prior Phase Completed: Discovery
+Discovery phase is complete for this product pair. Its outputs are:
+1. A list of impacted jobs, PROCs, and CTRLCARDS that use the Fast Load/Fast Unload batch utility, associated libraries, or SYSIN keywords/functions tied to this utility.
+2. Classification of those impacted jobs by (a) whether they are actively running in the system, and (b) whether they belong to an application in this team's scope.
+
+## Step 0 — Attachments (required before proceeding)
+You will be given three reference documents:
+1. **Discovery Phase High-Level Plan** — overall discovery approach across all 16 products in scope.
+2. **Discovery Phase Low-Level Plan** — the detailed task list used during discovery, in spreadsheet form. **Treat this file's column structure/headers as the format template to mirror for your output** (Step 4).
+3. **Design Phase High-Level Plan** — the initial, generic high-level plan for the design phase across all products.
+
+**Treat all three as reference material only — not as a rigid template.** They were written to cover all 16 products holistically at project start, so they may be generic, incomplete, or not specific to Fast Load/Fast Unload. Use them to understand structure and intent, not as instructions to copy verbatim.
+
+If any of the three attachments is missing, or if the Discovery LLP does not clearly show column headers, **stop and ask for it before generating output.** Do not guess the format.
+
+## Task
+Produce a **Design Phase Low-Level Plan (task list)** specific to CA Fast Load / CA Fast Unload → IBM DB2 Management Pack Solution Pack for z/OS, at the same granularity as the Discovery LLP, delivered as a downloadable spreadsheet.
+
+### Step 1 — Extract format
+From the attached Discovery LLP, extract the exact column headers/structure. Your final output must use this same column structure (add columns only if the Design HLP or this prompt requires information the Discovery LLP format doesn't capture — flag any such addition explicitly).
+
+### Step 2 — Align with Design HLP themes
+Review the attached Design HLP for this product's relevant phase-level themes/milestones. Note where it is generic/non-product-specific — those areas need to be translated into Fast Load/Fast Unload-specific tasks, not copied as-is.
+
+### Step 3 — Scope the population
+Populate the plan **only** for impacted components already identified in Discovery for this product pair — i.e., jobs/PROCs/CTRLCARDS flagged as (a) active and (b) belonging to an in-scope application. Do not invent components not present in the discovery data. If discovery data isn't attached/available, ask for it rather than fabricating example rows.
+
+### Step 4 — Task categories to consider (adapt, don't force-fit)
+The following are candidate design-phase task categories based on common patterns in DB2 utility replacement projects. Validate each against the actual Design HLP and discovery data — include only what's relevant, and add categories the Design HLP calls for that aren't listed here:
+- Control-card (SYSIN) syntax mapping: current Fast Load/Unload parameters vs. IBM DB2 Management Pack equivalents, per job/PROC
+- Identification of unsupported/deprecated parameters or functional gaps requiring workaround design
+- JCL/PROC changes required (program/step names, DD statements, library/STEPLIB references)
+- Downstream/upstream job and scheduling dependency impact
+- Security/RACF or dataset access changes, if applicable
+- Coordination checkpoints with the install/infra team and DBA team
+- Test case design (unit/system) per impacted component
+- Rollback/fallback plan design
+- Effort estimation and complexity rating per component
+- Risk/issue log entries specific to this product
+- Review/sign-off checkpoints
+
+### Step 5 — Output format
+Deliver as a downloadable spreadsheet (.xlsx preferred; .csv if the environment can't produce .xlsx), matching the Discovery LLP's column structure from Step 1.
+
+### Step 6 — Self-review (mandatory before final delivery)
+Before presenting the final file, review your own output against this checklist and correct any failures — report what you checked and what you fixed:
+- [ ] Column structure matches the Discovery LLP exactly (or additions are explicitly flagged and justified)
+- [ ] Every task is specific to Fast Load/Fast Unload → IBM DB2 Management Pack, not generic boilerplate reused across products
+- [ ] Every row traces back to an actual component from the attached discovery data — no fabricated job/PROC names
+- [ ] No duplicate or redundant tasks; consolidate where appropriate
+- [ ] Granularity is consistent across rows (not mixing high-level milestones with granular sub-tasks in the same list)
+- [ ] All relevant Design HLP themes for this product are represented; note any deliberate exclusions and why
+
+### Step 7 — Stop conditions
+If at any point the attachments are missing, unreadable, or insufficient to determine the format or the actual impacted component list, stop and ask the user for what's missing. Do not guess or fill gaps with assumed data.
+
+---
+
+**Deliverable:** One downloadable spreadsheet file (Design Phase Low-Level Plan for CA Fast Load/Fast Unload → IBM DB2 Management Pack Solution Pack for z/OS) plus a short written summary of the self-review findings from Step 6.
